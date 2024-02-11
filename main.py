@@ -63,8 +63,8 @@ def generate_trigonometric_data(sequence_length, num_samples):
 
 
 class ConvLSTM(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dim=64, num_layers=2, dropout=0.1, num_conv_layers=2,
-                 kernel_size=16):
+    def __init__(self, input_dim, num_classes, hidden_dim=128, num_layers=4, dropout=0.1, num_conv_layers=4,
+                 kernel_size=3):
         super(ConvLSTM, self).__init__()
 
         # Define initial convolutional layer
@@ -209,7 +209,7 @@ def generate_binance_data(steps, sequence_length, label_length, threshold_list, 
         # Save the raw data only
         save_dataset(data_save_path, btc_df)
 
-    features = btc_df[['open']].astype('float')
+    features = btc_df[['open', 'volume']].astype('float')
     samples, labels = process_features(features, sequence_length, label_length)
     discrete_labels = categorize_labels(labels, threshold_list)
 
@@ -355,7 +355,7 @@ def perform_epoch(phase, dataloader, model, criterion, device, optimizer=None):
 
 def train(num_epochs=1000, sequence_length=64, sequences=2 ** 11, batch_size=64, learning_rate=0.001):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # sequences, labels = generate_trigonometric_data(sequence_length, sequences)
+    #sequences, labels = generate_trigonometric_data(sequence_length, sequences)
     sequences, labels = generate_binance_data(sequences, sequence_length, 32, [0.05, 0.15])
     sequences, labels = sequences.to(device), labels.to(device)
     plot_labels(labels)
