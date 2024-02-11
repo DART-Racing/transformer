@@ -1,5 +1,6 @@
 import os
-
+import time
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -11,6 +12,8 @@ from sklearn.model_selection import train_test_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from binance.client import Client
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+np.random.seed(42)
 
 def generate_trigonometric_data(sequence_length, num_samples_per_class):
     # Initialize lists to collect samples
@@ -83,30 +86,83 @@ class FloatSequenceDataset(Dataset):
         return self.sequences[idx], self.labels[idx]
 
 
+def generate_binance_data(steps, sequence_length, label_length, threshold_list):
+    api_key = 'VOfm4JsL1JukjzmW2UFuEdVBU9skY1I5oHiLbdQdiaCr2iqbFA2845JXALGjFVM0'
+    api_secret = 'Qkw2YyLqPzUInYslHk1G8zFPob5Q7rim3mkLCAZE2H1eQBQjYlgPRt5htOgiIO2Q'
+    client = Client(api_key, api_secret)
+    # valid intervals - 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M
+    interval = '1m'
+    timestamp = 1000 * (int(time.time()) - 60 * steps)
+    bars = client.get_historical_klines('BTCUSDT', interval, timestamp, limit=1000)
+    btc_df = pd.DataFrame(bars, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time',
+                                         'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume',
+                                         'taker_buy_quote_asset_volume', 'ignore'])
+    data = btc_df[['open']].astype({'open': 'float'})
+
+    samples = []
+    labels = []
+
+    for i in range(0, len(data) - sequence_length - label_length + 1, sequence_length):
+        # Normalizing the sequence based on the last entry of the first n values
+        seq = data.iloc[i:i + sequence_length + label_length].values / data.iloc[i + sequence_length - 1]['open']
+        seq = (seq - 1) * 100
+
+        # The input sequence and label
+        sample = seq[:sequence_length]
+        label = np.max(seq[sequence_length:, 0])  # Using open price for labeling
+
+        samples.append(sample)
+        labels.append(label)
+
+    samples = np.array(samples)
+    labels = np.array(labels)
+
+    discrete_labels = []
+
+    for label in labels:
+        category = 0
+        for threshold in threshold_list:
+            if label < threshold:
+                break
+            category += 1
+        discrete_labels.append(category)
+
+    discrete_labels = np.array(discrete_labels)
+
+    samples_tensor = torch.tensor(samples, dtype=torch.float32)
+    labels_tensor = torch.tensor(discrete_labels, dtype=torch.long)
+    return samples_tensor, labels_tensor
+
+
+def shuffle_in_unison(a, b):
+    assert len(a) == len(b)
+    p = np.random.permutation(len(a))
+    return a[p], b[p]
+
+
 def train():
-    n_classes = 3
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    sequences, labels = generate_trigonometric_data(10, 1024)
-    sequences, labels = sequences.to(device), labels.to(device)  # Moving data to the correct device early
+    sequences, labels = generate_binance_data(100000, 60, 30, [0.1])
+    #sequences, labels = generate_trigonometric_data(60, 100)
+    sequences, labels = sequences.to(device), labels.to(device)
+    plot_labels(labels)
     input_dim = sequences.shape[-1]
 
-    train_sequences, val_sequences, train_labels, val_labels = train_test_split(
-        sequences, labels, test_size=0.2, random_state=42)
+    train_sequences, val_sequences, train_labels, val_labels = train_test_split(sequences, labels, test_size=0.2, random_state=42)
     train_dataset = FloatSequenceDataset(train_sequences, train_labels)
     val_dataset = FloatSequenceDataset(val_sequences, val_labels)
 
-
-    batch_size = 64  # Example batch size, adjust as needed
+    batch_size = 16  # Example batch size, adjust as needed
 
     # Create DataLoader instances with the new batch_size
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     # Model, criterion, optimizer, and scheduler creation follows...
-    model = SequenceTransformer(input_dim, n_classes).to(device)
+    model = SequenceTransformer(input_dim, len(torch.unique(val_labels))).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
-    scheduler = StepLR(optimizer, step_size=100, gamma=0.1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    scheduler = StepLR(optimizer, step_size=100000, gamma=0.5)
 
     # Early stopping and model checkpointing
     best_val_loss = float('inf')
@@ -116,69 +172,124 @@ def train():
     # Initialize SummaryWriter
     writer = SummaryWriter()
 
-    # Training loop
     num_epochs = 1000
     for epoch in range(num_epochs):
         model.train()
-        total_loss = 0
-        train_loader_tqdm = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} Training")
+        total_loss, total_accuracy, total_precision, total_recall, total_f1 = 0, 0, 0, 0, 0
+        total_samples = 0
+
+        train_loader_tqdm = tqdm(train_loader, desc=f"\nEpoch {epoch + 1}/{num_epochs} Training")
         for inputs, labels in train_loader_tqdm:
             inputs, labels = inputs.to(device), labels.to(device)
+
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+
             total_loss += loss.item()
-            train_loader_tqdm.set_postfix({"Training Loss": f"{loss.item():.4f}"})
 
+            _, predicted = torch.max(outputs.data, 1)
+            # Calculate metrics
+            predicted_np = predicted.cpu().numpy()
+            labels_np = labels.cpu().numpy()
+
+            total_accuracy += accuracy_score(labels_np, predicted_np)
+            total_precision += precision_score(labels_np, predicted_np, average='macro', zero_division=0)
+            total_recall += recall_score(labels_np, predicted_np, average='macro')
+            total_f1 += f1_score(labels_np, predicted_np, average='macro')
+            total_samples += 1
+
+        # Averages for the epoch
         avg_train_loss = total_loss / len(train_loader)
+        avg_train_accuracy = total_accuracy / total_samples
+        avg_train_precision = total_precision / total_samples
+        avg_train_recall = total_recall / total_samples
+        avg_train_f1 = total_f1 / total_samples
 
-        # Log training loss using tensorboard
+        # Log training metrics
         writer.add_scalar('Loss/train', avg_train_loss, epoch)
+        writer.add_scalar('Accuracy/train', avg_train_accuracy, epoch)
+        writer.add_scalar('Precision/train', avg_train_precision, epoch)
+        writer.add_scalar('Recall/train', avg_train_recall, epoch)
+        writer.add_scalar('F1_Score/train', avg_train_f1, epoch)
 
+        # Validation phase
         model.eval()
-        total_val_loss = 0
-        val_loader_tqdm = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{num_epochs} Validation")
+        total_val_loss, total_val_accuracy, total_val_precision, total_val_recall, total_val_f1 = 0, 0, 0, 0, 0
+        total_val_samples = 0
+
         with torch.no_grad():
+            val_loader_tqdm = tqdm(val_loader, desc=f"\nEpoch {epoch + 1}/{num_epochs} Validation")
             for inputs, labels in val_loader_tqdm:
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
+
                 total_val_loss += loss.item()
-                val_loader_tqdm.set_postfix({"Validation Loss": f"{loss.item():.4f}"})
+                _, predicted = torch.max(outputs.data, 1)
+                predicted_np = predicted.cpu().numpy()
+                labels_np = labels.cpu().numpy()
 
+                total_val_accuracy += accuracy_score(labels_np, predicted_np)
+                total_val_precision += precision_score(labels_np, predicted_np, average='macro', zero_division=0)
+                total_val_recall += recall_score(labels_np, predicted_np, average='macro')
+                total_val_f1 += f1_score(labels_np, predicted_np, average='macro')
+                total_val_samples += 1
+
+        # Averages for the epoch
         avg_val_loss = total_val_loss / len(val_loader)
+        avg_val_accuracy = total_val_accuracy / total_val_samples
+        avg_val_precision = total_val_precision / total_val_samples
+        avg_val_recall = total_val_recall / total_val_samples
+        avg_val_f1 = total_val_f1 / total_val_samples
 
-        # Log validation loss using tensorboard
+        # Log validation metrics
         writer.add_scalar('Loss/val', avg_val_loss, epoch)
-        writer.add_scalar('LR', scheduler.get_last_lr()[0], epoch)
+        writer.add_scalar('Accuracy/val', avg_val_accuracy, epoch)
+        writer.add_scalar('Precision/val', avg_val_precision, epoch)
+        writer.add_scalar('Recall/val', avg_val_recall, epoch)
+        writer.add_scalar('F1_Score/val', avg_val_f1, epoch)
+        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
 
-        # Checkpoint model if improvement in validation loss
+        # Checkpointing and early stopping logic
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), save_path)
-            print(f"Epoch {epoch + 1}: Validation loss improved, saving model in {save_path}")
+            print(f"\nEpoch {epoch + 1}: Validation loss improved, saving model in {save_path}")
             trials = 0  # Reset trials
         else:
             trials += 1
             if trials >= patience:
-                print(f"Early stopping on epoch {epoch + 1}")
+                print(f"\nEarly stopping on epoch {epoch + 1}")
                 break
 
         scheduler.step()  # Step the scheduler after each epoch
 
     writer.close()
 
+
+def plot_labels(labels):
+    if torch.is_tensor(labels):
+        labels = labels.cpu().numpy()  # Convert to NumPy array
+
+    weights = np.ones_like(labels) / len(labels)
+    labels_unique = np.unique(labels)
+
+    for i, label in enumerate(labels_unique):
+        plt.hist(labels[labels == label], bins=np.arange(len(labels_unique) + 1) - 0.5,
+                 weights=weights[labels == label], rwidth=0.8,
+                 label=f'Label {label}')
+
+    plt.legend()
+    plt.xlabel('Labels')
+    plt.ylabel('Probability')
+    plt.title('Probability Distribution of Labels')
+    plt.xticks(range(len(labels_unique)))  # Set x-ticks to correspond to labels
+
+    plt.show()
+
+
 if __name__ == '__main__':
-    api_key = 'VOfm4JsL1JukjzmW2UFuEdVBU9skY1I5oHiLbdQdiaCr2iqbFA2845JXALGjFVM0'
-    api_secret = 'Qkw2YyLqPzUInYslHk1G8zFPob5Q7rim3mkLCAZE2H1eQBQjYlgPRt5htOgiIO2Q'
-    client = Client(api_key, api_secret)
-    interval = '1h'
-    timestamp = client._get_earliest_valid_timestamp('BTCUSDT', interval)
-    print(timestamp)
-    # valid intervals - 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M
-    bars = client.get_historical_klines('BTCUSDT', interval, timestamp, limit=1000)
-    btc_df = pd.DataFrame(bars, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-    length_of_dataframe = len(btc_df)
-    print("Length of DataFrame:", length_of_dataframe)
+    train()
