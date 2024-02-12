@@ -1,22 +1,20 @@
+import io
 import os
 import pickle
-import time
+import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-import torch.nn.functional as F
 from torch.optim.lr_scheduler import StepLR
-from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from binance.client import Client
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import torch.optim as optim
-from sklearn.metrics import confusion_matrix, classification_report
-import itertools
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 np.random.seed(42)
 
@@ -57,105 +55,31 @@ def generate_trigonometric_data(sequence_length, num_samples):
 
     # Convert to PyTorch tensors and add a channel dimension
     data_tensor = torch.tensor(data_shuffled, dtype=torch.float32).unsqueeze(-1)
-    labels_tensor = torch.tensor(labels_shuffled, dtype=torch.long)
+    labels_tensor = torch.tensor(labels_shuffled, dtype=torch.float32)
 
     return data_tensor, labels_tensor
 
 
 class ConvLSTM(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dim=128, num_layers=4, dropout=0.1, num_conv_layers=4,
-                 kernel_size=3):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2, dropout=0.1, num_conv_layers=0, kernel_size=3):
         super(ConvLSTM, self).__init__()
-
-        # Define initial convolutional layer
-        self.conv_layers = nn.ModuleList([nn.Conv1d(in_channels=input_dim, out_channels=hidden_dim,
-                                                    kernel_size=kernel_size, padding=kernel_size // 2)])
-
-        # Add more convolutional layers, if required
-        for _ in range(1, num_conv_layers):
-            self.conv_layers.append(nn.Conv1d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=kernel_size,
-                                              padding=kernel_size // 2))
-
-        # Define LSTM layer
-        self.lstm = nn.LSTM(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True,
-                            dropout=dropout)
-
-        # Output layer
-        self.output_layer = nn.Linear(hidden_dim, num_classes)
+        self.conv_layers = nn.ModuleList([])
+        for _ in range(num_conv_layers):
+            self.conv_layers.append(nn.Conv1d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=kernel_size, padding=kernel_size // 2))
+        self.lstm = nn.LSTM(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout)
+        self.output_layer = nn.Linear(hidden_dim, 1)
 
     def forward(self, src):
         # Assume src is of shape: (batch_size, sequence_length, input_dim)
         # Conv1d expects: (batch_size, channels, sequence_length)
-        src = src.transpose(1, 2)  # Now shape: (batch_size, input_dim, sequence_length)
-
-        # Apply convolutional layers
+        src = src.transpose(1, 2)
         for conv in self.conv_layers:
             src = torch.relu(conv(src))
-
-        # Adjust the shape to fit LSTM layer
-        src = src.transpose(1, 2)  # Back to: (batch_size, sequence_length, hidden_dim)
-
-        # LSTM layers
-        lstm_out, (hn, cn) = self.lstm(src)
-
-        # Use the last hidden state
-        output = hn[-1]
-
-        # Fully connected layer to get the logits
-        logits = self.output_layer(output)
-
-        return logits
-
-
-class SequenceLSTM(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dim=64, num_layers=2, dropout=0.1):
-        super(SequenceLSTM, self).__init__()
-        self.embedding = nn.Linear(input_dim, hidden_dim)
-        self.lstm = nn.LSTM(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True,
-                            dropout=dropout)
-        self.output_layer = nn.Linear(hidden_dim, num_classes)
-
-    def forward(self, src):
-        src = self.embedding(src)
+        src = src.transpose(1, 2)
         lstm_out, (hn, cn) = self.lstm(src)
         output = hn[-1]
-        logits = self.output_layer(output)
-        return logits
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=64):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(np.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
-        return x
-
-
-class SequenceTransformer(nn.Module):
-    def __init__(self, input_dim, num_classes, dim_model=64, num_heads=8, num_encoder_layers=2, dropout=0.1):
-        super().__init__()
-        self.embedding = nn.Linear(input_dim, dim_model)
-        self.pos_encoder = PositionalEncoding(dim_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=dim_model, nhead=num_heads, dropout=dropout,
-                                                   batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
-        self.output_layer = nn.Linear(dim_model, num_classes)
-
-    def forward(self, src):
-        src = self.embedding(src)
-        src = self.pos_encoder(src)
-        output = self.transformer_encoder(src)
-        output = output.mean(dim=1)
-        logits = self.output_layer(output)
-        return logits
+        prediction = self.output_layer(output)
+        return prediction
 
 
 class FloatSequenceDataset(Dataset):
@@ -184,7 +108,7 @@ def data_exists(filename):
     return os.path.isfile(filename)
 
 
-def generate_binance_data(steps, sequence_length, label_length, threshold_list, data_save_path='binance_data.pkl'):
+def generate_binance_data(steps, sequence_length, label_length, data_save_path='binance_data.pkl'):
     if data_exists(data_save_path):
         print("Loading raw data from file...")
         btc_df = load_dataset(data_save_path)
@@ -211,11 +135,10 @@ def generate_binance_data(steps, sequence_length, label_length, threshold_list, 
 
     features = btc_df[['open', 'volume']].astype('float')
     samples, labels = process_features(features, sequence_length, label_length)
-    discrete_labels = categorize_labels(labels, threshold_list)
 
     # Conversion to PyTorch tensors
     samples_tensor = torch.tensor(samples, dtype=torch.float32)
-    labels_tensor = torch.tensor(discrete_labels, dtype=torch.long)
+    labels_tensor = torch.tensor(labels, dtype=torch.float32)
 
     return samples_tensor, labels_tensor
 
@@ -230,7 +153,7 @@ def process_features(features, sequence_length, label_length):
         normalized_seq = (features.iloc[i:i + sequence_length + label_length] / last_entry - 1) * 100
 
         sample = normalized_seq.iloc[:sequence_length].values
-        label = normalized_seq.iloc[sequence_length:, 0].max()
+        label = normalized_seq.iloc[sequence_length:, 0].mean()
 
         samples.append(sample)
         labels.append(label)
@@ -238,77 +161,36 @@ def process_features(features, sequence_length, label_length):
     return np.array(samples), np.array(labels)
 
 
-def categorize_labels(labels, threshold_list):
-    return np.array([sum(label >= np.array(threshold_list)) for label in labels])
-
-
-def calculate_extended_metrics(predictions, true_labels, device):
+def calculate_regression_metrics(predictions, true_labels, device='cpu'):
     """
-    Calculate metrics using tensors to avoid unnecessary data movement from GPU to CPU.
+    Calculate regression metrics.
     """
+    # Ensure tensors are on the right device
     predictions = predictions.to(device)
     true_labels = true_labels.to(device)
 
-    conf_matrix = confusion_matrix(true_labels.cpu().numpy(), predictions.cpu().numpy())
-    class_report = classification_report(true_labels.cpu().numpy(), predictions.cpu().numpy(), output_dict=True,
-                                         zero_division=0)
+    # Move data back to CPU for sklearn compatibility
+    predictions_np = predictions.cpu().numpy()
+    true_labels_np = true_labels.cpu().numpy()
 
-    # To calculate accuracy, precision, recall, and F1 score, the data must be transferred to CPU
-    accuracy = accuracy_score(true_labels.cpu().numpy(), predictions.cpu().numpy())
-    precision = precision_score(true_labels.cpu().numpy(), predictions.cpu().numpy(), average='macro', zero_division=0)
-    recall = recall_score(true_labels.cpu().numpy(), predictions.cpu().numpy(), average='macro')
-    f1 = f1_score(true_labels.cpu().numpy(), predictions.cpu().numpy(), average='macro')
+    # Calculate common regression metrics
+    mse = mean_squared_error(true_labels_np, predictions_np)
+    rmse = mean_squared_error(true_labels_np, predictions_np, squared=False)
+    mae = mean_absolute_error(true_labels_np, predictions_np)
+    r2 = r2_score(true_labels_np, predictions_np)
 
-    return accuracy, precision, recall, f1, conf_matrix, class_report
-
-
-def plot_confusion_matrix(cm, class_names):
-    """
-    Returns a matplotlib figure containing the plotted confusion matrix with enhanced text for readability and better visual representation.
-    """
-    figure = plt.figure(figsize=(12, 12))  # Slightly adjusted for optimal fitting
-    cmap = plt.get_cmap('Blues')  # Gets a clearer colormap
-    plt.imshow(cm, interpolation='nearest', cmap=cmap)
-    plt.title("Confusion matrix", fontsize=24)  # Adjust font size appropriately
-    tick_marks = np.arange(len(class_names))
-    plt.xticks(tick_marks, class_names, rotation=45, fontsize=18)  # Adjust font size for readability
-    plt.yticks(tick_marks, class_names, fontsize=18)
-
-    # Normalize the confusion matrix for better clarity on the proportions
-    normalized_cm = np.around(cm.astype('float') / cm.sum(axis=1)[:, np.newaxis], decimals=2)
-
-    # Adjust text color for optimal contrast
-    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
-        cm_value = normalized_cm[i, j]
-        if cm_value > 0.5:  # If cell is predominantly occupied, use a different color
-            color = "white"
-        else:
-            color = "black"
-
-        plt.text(j, i, cm_value, horizontalalignment="center", color=color,
-                 fontsize=40)  # Slightly reduced font for subtle emphasis
-
-    plt.tight_layout()
-    plt.ylabel('True label', fontsize=20)
-    plt.xlabel('Predicted label', fontsize=20)
-    return figure
+    return mse, rmse, mae, r2
 
 
-def log_metrics(writer, phase, metrics, epoch, class_names=['bad', 'neutral', 'good']):
-    loss, accuracy, precision, recall, f1, conf_matrix, class_report = metrics
-    writer.add_scalar(f'Loss/{phase}', loss, epoch)
-    writer.add_scalar(f'Accuracy/{phase}', accuracy, epoch)
-    writer.add_scalar(f'Precision/{phase}', precision, epoch)
-    writer.add_scalar(f'Recall/{phase}', recall, epoch)
-    writer.add_scalar(f'F1_Score/{phase}', f1, epoch)
-
-    # for class_name, class_metrics in class_report.items():
-    #     if class_name not in ['accuracy', 'macro avg', 'weighted avg']:
-    #         writer.add_scalars(f'{class_name}/{phase}', class_metrics, epoch)
-
-    # Log Confusion Matrix
-    fig = plot_confusion_matrix(conf_matrix, class_names)
-    writer.add_figure(f'Confusion Matrix/{phase}', fig, epoch)
+def log_regression_metrics(writer, phase, results, epoch):
+    metrics, all_labels, all_predictions = results
+    avg_loss, mse, rmse, mae, r2 = metrics
+    writer.add_scalar(f'Loss/{phase}', mse, epoch)
+    writer.add_scalar(f'MSE/{phase}', mse, epoch)
+    writer.add_scalar(f'RMSE/{phase}', rmse, epoch)
+    writer.add_scalar(f'MAE/{phase}', mae, epoch)
+    writer.add_scalar(f'R2/{phase}', r2, epoch)
+    log_predictions_vs_actuals(all_predictions, all_labels, phase, writer, epoch)
 
 
 def perform_epoch(phase, dataloader, model, criterion, device, optimizer=None):
@@ -323,54 +205,52 @@ def perform_epoch(phase, dataloader, model, criterion, device, optimizer=None):
     all_predictions = []
 
     with torch.set_grad_enabled(phase == 'train'):
-        for inputs, labels in tqdm(dataloader, desc=f"\n{phase.title()}"):
+        for inputs, labels in tqdm(dataloader, desc=f"\n{phase.title()} Epoch"):
             inputs = inputs.to(device)
             labels = labels.to(device)
 
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs.squeeze(), labels)
 
             if phase == 'train':
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-            _, predicted = torch.max(outputs.data, 1)
             all_labels.append(labels)
-            all_predictions.append(predicted)
+            all_predictions.append(outputs.detach())  # Store raw outputs
 
             total_loss += loss.item() * inputs.size(0)
 
     all_labels = torch.cat(all_labels, dim=0)
     all_predictions = torch.cat(all_predictions, dim=0)
 
-    accuracy, precision, recall, f1, conf_matrix, class_report = calculate_extended_metrics(all_predictions, all_labels,
-                                                                                            device)
+    # Calculate regression metrics
+    mse, rmse, mae, r2 = calculate_regression_metrics(all_predictions, all_labels, device)
 
     avg_loss = total_loss / len(dataloader.dataset)
-    avg_metrics = (avg_loss, accuracy, precision, recall, f1)
+    avg_metrics = (avg_loss, mse, rmse, mae, r2)
 
-    return avg_metrics, conf_matrix, class_report
+    return avg_metrics, all_labels, all_predictions  # No need to return confusion matrix or classification report
 
 
 def train(num_epochs=1000, sequence_length=64, sequences=2 ** 11, batch_size=64, learning_rate=0.001):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     #sequences, labels = generate_trigonometric_data(sequence_length, sequences)
-    sequences, labels = generate_binance_data(sequences, sequence_length, 32, [0.05, 0.15])
+    sequences, labels = generate_binance_data(sequences, sequence_length, 32)
     sequences, labels = sequences.to(device), labels.to(device)
-    plot_labels(labels)
+    plot_value_distribution(labels)
 
     input_dim = sequences.shape[-1]
-    train_sequences, val_sequences, train_labels, val_labels = train_test_split(sequences, labels, test_size=0.2,
-                                                                                random_state=42)
+    train_sequences, val_sequences, train_labels, val_labels = train_test_split(sequences, labels, test_size=0.2, random_state=42)
     train_dataset = FloatSequenceDataset(train_sequences, train_labels)
     val_dataset = FloatSequenceDataset(val_sequences, val_labels)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
-    model = ConvLSTM(input_dim, len(torch.unique(val_labels))).to(device)
-    criterion = nn.CrossEntropyLoss()
+    model = ConvLSTM(input_dim).to(device)
+    criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = StepLR(optimizer, step_size=100000, gamma=0.5)
 
@@ -380,15 +260,15 @@ def train(num_epochs=1000, sequence_length=64, sequences=2 ** 11, batch_size=64,
     patience, trials = 100000, 0
 
     for epoch in range(num_epochs):
-        train_metrics, train_conf_matrix, train_class_report = perform_epoch('train', train_loader, model, criterion,
-                                                                             device, optimizer)
-        val_metrics, val_conf_matrix, val_class_report = perform_epoch('val', val_loader, model, criterion, device)
+        train_results = perform_epoch('train', train_loader, model, criterion, device, optimizer)
+        val_results = perform_epoch('val', val_loader, model, criterion, device)
 
-        log_metrics(writer, 'train', train_metrics + (train_conf_matrix, train_class_report), epoch)
-        log_metrics(writer, 'val', val_metrics + (val_conf_matrix, val_class_report), epoch)
+        log_regression_metrics(writer, 'train', train_results, epoch)
+        log_regression_metrics(writer, 'val', val_results, epoch)
+
         writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
 
-        val_loss = val_metrics[0]
+        val_loss = val_results[0][0]
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), 'model_best.pth')
@@ -405,26 +285,56 @@ def train(num_epochs=1000, sequence_length=64, sequences=2 ** 11, batch_size=64,
     writer.close()
 
 
-def plot_labels(labels):
-    if torch.is_tensor(labels):
-        labels = labels.cpu().numpy()  # Convert to NumPy array
+def plot_value_distribution(values, plot_type='density'):
+    """
+    Plot the distribution of float values (e.g., target variable in regression tasks).
 
-    weights = np.ones_like(labels) / len(labels)
-    labels_unique = np.unique(labels)
+    Parameters:
+    - values: a tensor or numpy array containing the float values.
+    - plot_type: 'histogram' for a histogram plot or 'density' for a density plot.
+    """
+    if torch.is_tensor(values):
+        values = values.cpu().numpy()  # Convert to NumPy array if input is a tensor
 
-    for i, label in enumerate(labels_unique):
-        plt.hist(labels[labels == label], bins=np.arange(len(labels_unique) + 1) - 0.5,
-                 weights=weights[labels == label], rwidth=0.8,
-                 label=f'Label {label}')
+    plt.figure(figsize=(10, 6))
 
-    plt.legend()
-    plt.xlabel('Labels')
-    plt.ylabel('Probability')
-    plt.title('Probability Distribution of Labels')
-    plt.xticks(range(len(labels_unique)))  # Set x-ticks to correspond to labels
+    if plot_type == 'histogram':
+        plt.hist(values, bins=30, edgecolor='k', alpha=0.7)
+        plt.ylabel('Frequency')
+    elif plot_type == 'density':
+        sns.kdeplot(values, bw_adjust=0.5)
+        plt.ylabel('Density')
+    else:
+        raise ValueError("plot_type must be either 'histogram' or 'density'")
 
+    plt.xlabel('Value')
+    plt.title('Distribution of Values')
+    plt.grid(True)
     plt.show()
 
 
+def log_predictions_vs_actuals(predictions, actuals, phase, writer, epoch):
+    # Create a figure for plotting
+    fig = plt.figure()
+    plt.scatter(actuals.cpu().numpy(), predictions.cpu().numpy())
+    plt.xlabel('Actual Values')
+    plt.ylabel('Predictions')
+    plt.title('Predictions vs. Actual Values')
+
+    # Plot the diagonal line for reference
+    plt.plot([actuals.min(), actuals.max()], [actuals.min(), actuals.max()], 'k--', lw=4)
+
+    # Instead of plt.show(), we save figure to a buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+
+    # Log the plot to TensorBoard
+    writer.add_image(f'Predictions/{phase}', plt.imread(buf), epoch, dataformats='HWC')
+
+    # Close the figure to prevent it from being displayed in the notebook/IDE output
+    plt.close(fig)
+
+
 if __name__ == '__main__':
-    train(sequences=6400)
+    train(sequences=6400, learning_rate=0.001)
